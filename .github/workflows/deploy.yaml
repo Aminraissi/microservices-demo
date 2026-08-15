@@ -1,29 +1,3 @@
-  debug-oidc:
-    name: Debug GitHub OIDC
-    runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - name: Inspect OIDC claims
-        shell: bash
-        run: |
-          echo "Repository : $GITHUB_REPOSITORY"
-          echo "Ref        : $GITHUB_REF"
-          echo "Branch     : $GITHUB_REF_NAME"
-          echo "Event      : $GITHUB_EVENT_NAME"
-
-          TOKEN=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | python -c "import sys,json; print(json.load(sys.stdin)['value'])")
-
-          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
-
-          python - "$PAYLOAD" <<'PY'
-
 name: CI/CD - Build, Push to ECR and Deploy to EKS
 
 on:
@@ -37,52 +11,52 @@ env:
   ECR_REGISTRY: 501161805281.dkr.ecr.eu-west-1.amazonaws.com
   EKS_CLUSTER: googleCluster
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
 
   # ============================================================
-  # BUILD AND PUSH IMAGES
+  # 1. BUILD + PUSH TO ECR
   # ============================================================
 
   build-and-push:
 
-    name: Build and Push Images to ECR
+    name: Build and Push Images
 
     runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
 
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
 
     steps:
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Checkout
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Generate image tag
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Generate image tag
         id: tag
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
 
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
           echo "======================================"
-          echo "IMAGE TAG: ${IMAGE_TAG}"
+          echo "IMAGE TAG: $IMAGE_TAG"
           echo "======================================"
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # AWS OIDC
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -90,31 +64,31 @@ jobs:
           role-to-assume: arn:aws:iam::501161805281:role/test
           aws-region: ${{ env.AWS_REGION }}
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Verify AWS
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # ----------------------------------------------------------
-      # Login ECR
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Login to ECR
+      # --------------------------------------------------------
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Docker Buildx
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ----------------------------------------------------------
-      # Build all microservices
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Build + Push all services
+      # --------------------------------------------------------
 
       - name: Build and push microservices
         env:
@@ -144,16 +118,13 @@ jobs:
             echo "BUILDING: $SERVICE"
             echo "======================================"
 
+            # cartservice has a different Dockerfile location
             if [ "$SERVICE" = "cartservice" ]; then
-
               DOCKERFILE="src/cartservice/src/Dockerfile"
               CONTEXT="src/cartservice"
-
             else
-
               DOCKERFILE="src/${SERVICE}/Dockerfile"
               CONTEXT="src/${SERVICE}"
-
             fi
 
             docker buildx build \
@@ -169,9 +140,9 @@ jobs:
 
           done
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Verify ECR
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Verify ECR images
         env:
@@ -196,7 +167,7 @@ jobs:
           for SERVICE in "${SERVICES[@]}"
           do
 
-            echo "Checking $SERVICE..."
+            echo "Checking ECR repository: $SERVICE"
 
             aws ecr describe-images \
               --repository-name "$SERVICE" \
@@ -207,7 +178,7 @@ jobs:
 
 
   # ============================================================
-  # DEPLOY TO EKS
+  # 2. DEPLOY TO EKS
   # ============================================================
 
   deploy:
@@ -219,22 +190,18 @@ jobs:
     needs:
       - build-and-push
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
 
-      # ----------------------------------------------------------
-      # Checkout
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Checkout repository
+      # --------------------------------------------------------
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # AWS OIDC
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -242,17 +209,17 @@ jobs:
           role-to-assume: arn:aws:iam::501161805281:role/test
           aws-region: ${{ env.AWS_REGION }}
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Verify AWS
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Configure kubectl
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Configure kubectl
         run: |
@@ -267,9 +234,9 @@ jobs:
 
           kubectl get nodes
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Install Kustomize
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Install Kustomize
         run: |
@@ -282,11 +249,12 @@ jobs:
 
           kustomize version
 
-      # ----------------------------------------------------------
-      # Generate ECR Kustomize overlay
-      # ----------------------------------------------------------
+      # ========================================================
+      # Generate AWS ECR overlay
+      # ========================================================
 
-      - name: Generate ECR overlay
+      - name: Generate ECR Kustomize overlay
+
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
 
@@ -350,18 +318,20 @@ jobs:
 
           EOF
 
-      # ----------------------------------------------------------
-      # Validate generated manifests
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Validate manifests
+      # --------------------------------------------------------
 
       - name: Validate Kubernetes manifests
+
         run: |
 
           echo "======================================"
           echo "KUSTOMIZE BUILD"
           echo "======================================"
 
-          kustomize build kustomize/overlays/aws-ecr \
+          kustomize build \
+            kustomize/overlays/aws-ecr \
             > /tmp/manifests.yaml
 
           echo ""
@@ -371,11 +341,12 @@ jobs:
 
           grep "image:" /tmp/manifests.yaml
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Deploy
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Deploy to EKS
+
         run: |
 
           echo "======================================"
@@ -386,11 +357,12 @@ jobs:
             -k kustomize/overlays/aws-ecr \
             --namespace default
 
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
       # Wait for deployments
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
 
       - name: Wait for deployments
+
         run: |
 
           DEPLOYMENTS=(
@@ -419,11 +391,12 @@ jobs:
 
           done
 
-      # ----------------------------------------------------------
-      # Cluster status
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Show cluster status
+      # --------------------------------------------------------
 
       - name: Show cluster status
+
         run: |
 
           echo "======================================"
@@ -439,11 +412,12 @@ jobs:
 
           kubectl get services
 
-      # ----------------------------------------------------------
-      # Get LoadBalancer URL
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # Get application URL
+      # --------------------------------------------------------
 
       - name: Get application URL
+
         run: |
 
           echo "Waiting for LoadBalancer..."
@@ -462,6 +436,7 @@ jobs:
             fi
 
             echo "LoadBalancer not ready yet..."
+
             sleep 10
 
           done
@@ -486,62 +461,86 @@ jobs:
 
           fi
 
-      # ----------------------------------------------------------
-      # GitHub Actions summary
-      # ----------------------------------------------------------
+      # --------------------------------------------------------
+      # GitHub Summary
+      # --------------------------------------------------------
 
       - name: Deployment summary
+
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
 
         run: |
 
-          echo "# 🚀 Deployment Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "# 🚀 Deployment Report" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Image Tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Image Tag" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "\`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE_TAG\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## EKS Cluster" >> "$GITHUB_STEP_SUMMARY"
+          echo "## EKS Cluster" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "\`$EKS_CLUSTER\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$EKS_CLUSTER\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## AWS Region" >> "$GITHUB_STEP_SUMMARY"
+          echo "## AWS Region" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "\`$AWS_REGION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$AWS_REGION\`" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Pods" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Pods" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          kubectl get pods >> "$GITHUB_STEP_SUMMARY"
+          kubectl get pods \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Services" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Services" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          kubectl get services >> "$GITHUB_STEP_SUMMARY"
+          kubectl get services \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Application" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Application" \
+            >> "$GITHUB_STEP_SUMMARY"
 
           if [ -n "${FRONTEND_URL:-}" ]; then
-            echo "$FRONTEND_URL" >> "$GITHUB_STEP_SUMMARY"
+            echo "$FRONTEND_URL" \
+              >> "$GITHUB_STEP_SUMMARY"
           else
             echo "LoadBalancer URL not available yet." \
               >> "$GITHUB_STEP_SUMMARY"
