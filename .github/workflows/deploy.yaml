@@ -1,3 +1,29 @@
+  debug-oidc:
+    name: Debug GitHub OIDC
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Inspect OIDC claims
+        shell: bash
+        run: |
+          echo "Repository : $GITHUB_REPOSITORY"
+          echo "Ref        : $GITHUB_REF"
+          echo "Branch     : $GITHUB_REF_NAME"
+          echo "Event      : $GITHUB_EVENT_NAME"
+
+          TOKEN=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | python -c "import sys,json; print(json.load(sys.stdin)['value'])")
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
+
+          python - "$PAYLOAD" <<'PY'
+
 name: CI/CD - Build, Push to ECR and Deploy to EKS
 
 on:
