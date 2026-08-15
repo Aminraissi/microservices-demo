@@ -1,4 +1,3 @@
-```yaml
 name: CI/CD - Build, Push to ECR and Deploy to EKS
 
 on:
@@ -20,8 +19,9 @@ env:
 jobs:
 
   # ============================================================
-  # BUILD AND PUSH
+  # BUILD AND PUSH IMAGES
   # ============================================================
+
   build-and-push:
     name: Build and Push Images
     runs-on: ubuntu-latest
@@ -39,6 +39,10 @@ jobs:
 
       - name: Verify AWS Identity
         run: |
+          echo "======================================"
+          echo "AWS IDENTITY"
+          echo "======================================"
+
           aws sts get-caller-identity
 
       - name: Login to Amazon ECR
@@ -51,8 +55,13 @@ jobs:
         shell: bash
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-          echo "IMAGE TAG: $IMAGE_TAG"
+
+          echo "======================================"
+          echo "IMAGE TAG"
+          echo "======================================"
+          echo "$IMAGE_TAG"
 
       - name: Build and Push Images
         shell: bash
@@ -74,6 +83,7 @@ jobs:
 
           for SERVICE in "${SERVICES[@]}"; do
 
+            echo ""
             echo "======================================"
             echo "BUILDING: $SERVICE"
             echo "======================================"
@@ -82,7 +92,8 @@ jobs:
             CONTEXT="src/$SERVICE"
             DOCKERFILE="$CONTEXT/Dockerfile"
 
-            # cartservice has a different Dockerfile/context
+            # cartservice has Dockerfile and .csproj
+            # inside src/cartservice/src
             if [ "$SERVICE" = "cartservice" ]; then
               CONTEXT="src/cartservice/src"
               DOCKERFILE="src/cartservice/src/Dockerfile"
@@ -92,11 +103,19 @@ jobs:
             echo "Context:    $CONTEXT"
 
             # Verify Dockerfile
-            test -f "$DOCKERFILE"
+            if [ ! -f "$DOCKERFILE" ]; then
+              echo "ERROR: Dockerfile not found:"
+              echo "$DOCKERFILE"
+              exit 1
+            fi
 
-            # Verify cartservice project file
+            # Verify cartservice project
             if [ "$SERVICE" = "cartservice" ]; then
-              test -f "$CONTEXT/cartservice.csproj"
+              if [ ! -f "$CONTEXT/cartservice.csproj" ]; then
+                echo "ERROR: cartservice.csproj not found:"
+                echo "$CONTEXT/cartservice.csproj"
+                exit 1
+              fi
             fi
 
             docker buildx build \
@@ -107,6 +126,7 @@ jobs:
               --push \
               "$CONTEXT"
 
+            echo ""
             echo "Successfully pushed:"
             echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
 
@@ -116,6 +136,7 @@ jobs:
   # ============================================================
   # DEPLOY TO EKS
   # ============================================================
+
   deploy:
     name: Deploy to EKS
     runs-on: ubuntu-latest
@@ -134,16 +155,24 @@ jobs:
 
       - name: Verify AWS Identity
         run: |
+          echo "======================================"
+          echo "AWS IDENTITY"
+          echo "======================================"
+
           aws sts get-caller-identity
 
-      # --------------------------------------------------------
-      # EKS CHECK
-      # --------------------------------------------------------
+
+      # ========================================================
+      # VERIFY EKS
+      # ========================================================
 
       - name: Verify EKS Cluster
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
-          echo "VERIFYING EKS CLUSTER"
+          echo "VERIFYING EKS"
           echo "======================================"
 
           aws eks describe-cluster \
@@ -152,16 +181,20 @@ jobs:
             --query 'cluster.status' \
             --output text
 
-      # --------------------------------------------------------
-      # KUBECTL
-      # --------------------------------------------------------
+
+      # ========================================================
+      # INSTALL KUBECTL
+      # ========================================================
 
       - name: Install kubectl
         shell: bash
         run: |
+          set -e
+
           KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
 
-          curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -LO \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
 
           chmod +x kubectl
 
@@ -169,31 +202,48 @@ jobs:
 
           kubectl version --client
 
-      # --------------------------------------------------------
-      # KUSTOMIZE
-      # --------------------------------------------------------
+
+      # ========================================================
+      # INSTALL KUSTOMIZE
+      # ========================================================
 
       - name: Install Kustomize
         shell: bash
         run: |
+          set -e
+
           KUSTOMIZE_VERSION="v5.7.1"
+
+          echo "Installing Kustomize $KUSTOMIZE_VERSION"
+
+          rm -rf /tmp/kustomize
+          rm -f /tmp/kustomize.tar.gz
 
           curl -L \
             "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
             -o /tmp/kustomize.tar.gz
 
-          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          mkdir -p /tmp/kustomize
 
-          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+          tar -xzf /tmp/kustomize.tar.gz \
+            -C /tmp/kustomize
+
+          sudo install \
+            /tmp/kustomize/kustomize \
+            /usr/local/bin/kustomize
 
           kustomize version
 
-      # --------------------------------------------------------
-      # EKS KUBECONFIG
-      # --------------------------------------------------------
+
+      # ========================================================
+      # CONFIGURE KUBECTL
+      # ========================================================
 
       - name: Configure kubectl for EKS
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
           echo "CONFIGURING EKS"
           echo "======================================"
@@ -202,16 +252,18 @@ jobs:
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER"
 
-          echo "Cluster:"
+          echo ""
+          echo "CLUSTER:"
           kubectl cluster-info
 
           echo ""
-          echo "Nodes:"
+          echo "NODES:"
           kubectl get nodes -o wide
 
-      # --------------------------------------------------------
-      # IMAGE TAG
-      # --------------------------------------------------------
+
+      # ========================================================
+      # SET IMAGE TAG
+      # ========================================================
 
       - name: Set Image Tag
         shell: bash
@@ -220,11 +272,15 @@ jobs:
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
 
-          echo "IMAGE TAG: $IMAGE_TAG"
+          echo "======================================"
+          echo "IMAGE TAG"
+          echo "======================================"
+          echo "$IMAGE_TAG"
 
-      # --------------------------------------------------------
-      # UPDATE IMAGES
-      # --------------------------------------------------------
+
+      # ========================================================
+      # UPDATE KUSTOMIZE IMAGES
+      # ========================================================
 
       - name: Update Kubernetes Images
         shell: bash
@@ -250,7 +306,7 @@ jobs:
 
           for SERVICE in "${SERVICES[@]}"; do
 
-            echo "Updating image for $SERVICE"
+            echo "Updating $SERVICE"
 
             kustomize edit set image \
               "$ECR_REGISTRY/$SERVICE=$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
@@ -258,12 +314,16 @@ jobs:
           done
 
           echo ""
-          echo "Generated kustomization.yaml:"
+          echo "======================================"
+          echo "FINAL KUSTOMIZATION"
+          echo "======================================"
+
           cat kustomization.yaml
 
-      # --------------------------------------------------------
+
+      # ========================================================
       # VALIDATE MANIFESTS
-      # --------------------------------------------------------
+      # ========================================================
 
       - name: Validate Kubernetes Manifests
         shell: bash
@@ -280,11 +340,13 @@ jobs:
             --dry-run=client \
             -f /tmp/rendered.yaml
 
+          echo ""
           echo "Manifest validation successful."
 
-      # --------------------------------------------------------
+
+      # ========================================================
       # DEPLOY
-      # --------------------------------------------------------
+      # ========================================================
 
       - name: Deploy to EKS
         shell: bash
@@ -297,9 +359,13 @@ jobs:
 
           kustomize build . | kubectl apply -f -
 
-      # --------------------------------------------------------
-      # STATUS
-      # --------------------------------------------------------
+          echo ""
+          echo "Deployment applied successfully."
+
+
+      # ========================================================
+      # SHOW STATUS
+      # ========================================================
 
       - name: Show Deployment Status
         shell: bash
@@ -308,17 +374,22 @@ jobs:
           echo "DEPLOYMENT STATUS"
           echo "======================================"
 
+          echo ""
+          echo "DEPLOYMENTS:"
           kubectl get deployments
 
           echo ""
+          echo "PODS:"
           kubectl get pods -o wide
 
           echo ""
+          echo "SERVICES:"
           kubectl get services
 
-      # --------------------------------------------------------
+
+      # ========================================================
       # WAIT FOR DEPLOYMENTS
-      # --------------------------------------------------------
+      # ========================================================
 
       - name: Wait for Deployments
         shell: bash
@@ -342,8 +413,9 @@ jobs:
 
           for DEPLOYMENT in "${DEPLOYMENTS[@]}"; do
 
+            echo ""
             echo "======================================"
-            echo "Waiting for $DEPLOYMENT"
+            echo "WAITING FOR: $DEPLOYMENT"
             echo "======================================"
 
             kubectl rollout status \
@@ -360,12 +432,16 @@ jobs:
           done
 
           if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "One or more deployments failed."
+
             exit 1
           fi
 
-      # --------------------------------------------------------
+
+      # ========================================================
       # DIAGNOSTICS
-      # --------------------------------------------------------
+      # ========================================================
 
       - name: Diagnostics
         if: always()
@@ -392,8 +468,11 @@ jobs:
           kubectl get services || true
 
           echo ""
-          echo "RECENT EVENTS:"
+          echo "POD EVENTS:"
           kubectl get events \
             --sort-by='.lastTimestamp' \
             | tail -100 || true
-```
+
+          echo ""
+          echo "POD DESCRIPTIONS:"
+          kubectl describe pods || true
