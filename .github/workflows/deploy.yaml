@@ -1,53 +1,611 @@
-name: Debug GitHub OIDC
+name: CI/CD - Build, Push to ECR and Deploy to EKS
 
 on:
   push:
     branches:
       - main
+
   workflow_dispatch:
+
+env:
+  AWS_REGION: eu-west-1
+  AWS_ACCOUNT_ID: "501161805281"
+  ECR_REGISTRY: "501161805281.dkr.ecr.eu-west-1.amazonaws.com"
+  EKS_CLUSTER: googleCluster
+
+# ============================================================
+# GITHUB PERMISSIONS
+# ============================================================
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  debug-oidc:
+
+  # ============================================================
+  # 1. BUILD + PUSH TO ECR
+  # ============================================================
+
+  build-and-push:
+
+    name: Build and Push Images
+
     runs-on: ubuntu-latest
 
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+
     steps:
-      - name: Show GitHub context
+
+      # --------------------------------------------------------
+      # Checkout
+      # --------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Generate image tag
+      # --------------------------------------------------------
+
+      - name: Generate image tag
+        id: tag
         run: |
+
+          IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
           echo "======================================"
-          echo "GITHUB OIDC DEBUG"
+          echo "IMAGE TAG: $IMAGE_TAG"
           echo "======================================"
 
-          echo "Repository : $GITHUB_REPOSITORY"
-          echo "Ref        : $GITHUB_REF"
-          echo "Branch     : $GITHUB_REF_NAME"
-          echo "Event      : $GITHUB_EVENT_NAME"
+      # --------------------------------------------------------
+      # Configure AWS using OIDC
+      # --------------------------------------------------------
 
-      - name: Get OIDC token
-        id: oidc
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::501161805281:role/test
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # Verify AWS
+      # --------------------------------------------------------
+
+      - name: Verify AWS identity
         run: |
-          TOKEN=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | python -c "import sys,json; print(json.load(sys.stdin)['value'])")
 
-          echo "TOKEN:"
-          echo "$TOKEN"
+          echo "======================================"
+          echo "AWS IDENTITY"
+          echo "======================================"
 
-          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f2)
+          aws sts get-caller-identity
 
-          # Add padding for base64
-          PADDING=$((4 - ${#PAYLOAD} % 4))
-          if [ "$PADDING" -ne 4 ]; then
-            PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $PADDING))"
-          fi
+      # --------------------------------------------------------
+      # Login to ECR
+      # --------------------------------------------------------
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # --------------------------------------------------------
+      # Setup Docker Buildx
+      # --------------------------------------------------------
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # --------------------------------------------------------
+      # Build and push all microservices
+      # --------------------------------------------------------
+
+      - name: Build and push microservices
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+
+        run: |
+
+          SERVICES=(
+            adservice
+            cartservice
+            checkoutservice
+            currencyservice
+            emailservice
+            frontend
+            loadgenerator
+            paymentservice
+            productcatalogservice
+            recommendationservice
+            shippingservice
+          )
+
+          for SERVICE in "${SERVICES[@]}"
+          do
+
+            echo ""
+            echo "======================================"
+            echo "BUILDING: $SERVICE"
+            echo "======================================"
+
+            # cartservice has a special Dockerfile location
+            if [ "$SERVICE" = "cartservice" ]; then
+
+              DOCKERFILE="src/cartservice/src/Dockerfile"
+              CONTEXT="src/cartservice"
+
+            else
+
+              DOCKERFILE="src/${SERVICE}/Dockerfile"
+              CONTEXT="src/${SERVICE}"
+
+            fi
+
+            echo "Dockerfile: $DOCKERFILE"
+            echo "Context:    $CONTEXT"
+
+            docker buildx build \
+              --platform linux/amd64 \
+              --file "$DOCKERFILE" \
+              --tag "${ECR_REGISTRY}/${SERVICE}:${IMAGE_TAG}" \
+              --tag "${ECR_REGISTRY}/${SERVICE}:latest" \
+              --push \
+              "$CONTEXT"
+
+            echo ""
+            echo "Successfully pushed:"
+            echo "${ECR_REGISTRY}/${SERVICE}:${IMAGE_TAG}"
+
+          done
+
+      # --------------------------------------------------------
+      # Verify images in ECR
+      # --------------------------------------------------------
+
+      - name: Verify ECR images
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+
+        run: |
+
+          SERVICES=(
+            adservice
+            cartservice
+            checkoutservice
+            currencyservice
+            emailservice
+            frontend
+            loadgenerator
+            paymentservice
+            productcatalogservice
+            recommendationservice
+            shippingservice
+          )
+
+          echo "======================================"
+          echo "VERIFYING ECR IMAGES"
+          echo "======================================"
+
+          for SERVICE in "${SERVICES[@]}"
+          do
+
+            echo "Checking $SERVICE..."
+
+            aws ecr describe-images \
+              --repository-name "$SERVICE" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --region "$AWS_REGION" \
+              > /dev/null
+
+            echo "✓ $SERVICE OK"
+
+          done
+
+          echo ""
+          echo "All images successfully verified in ECR."
+
+
+  # ============================================================
+  # 2. DEPLOY TO EKS
+  # ============================================================
+
+  deploy:
+
+    name: Deploy to EKS
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-and-push
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout
+      # --------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Configure AWS using OIDC
+      # --------------------------------------------------------
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::501161805281:role/test
+          aws-region: ${{ env.AWS_REGION }}
+
+      # --------------------------------------------------------
+      # Verify AWS
+      # --------------------------------------------------------
+
+      - name: Verify AWS identity
+        run: |
+
+          echo "======================================"
+          echo "AWS IDENTITY"
+          echo "======================================"
+
+          aws sts get-caller-identity
+
+      # --------------------------------------------------------
+      # Configure kubectl
+      # --------------------------------------------------------
+
+      - name: Configure kubectl
+        run: |
+
+          echo "======================================"
+          echo "CONFIGURING EKS"
+          echo "======================================"
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER"
 
           echo ""
           echo "======================================"
-          echo "OIDC CLAIMS"
+          echo "EKS NODES"
           echo "======================================"
 
-          echo "$PAYLOAD" | base64 -d | python -m json.tool
+          kubectl get nodes
+
+      # --------------------------------------------------------
+      # Install Kustomize
+      # --------------------------------------------------------
+
+      - name: Install Kustomize
+        run: |
+
+          curl -s \
+            "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" \
+            | bash
+
+          sudo mv kustomize /usr/local/bin/kustomize
+
+          echo "Kustomize version:"
+          kustomize version
+
+      # ========================================================
+      # PREPARE KUSTOMIZE OVERLAY
+      # ========================================================
+
+      - name: Generate ECR Kustomize overlay
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
+        run: |
+
+          echo "======================================"
+          echo "CREATING ECR OVERLAY"
+          echo "======================================"
+
+          mkdir -p kustomize/overlays/aws-ecr
+
+          cat > kustomize/overlays/aws-ecr/kustomization.yaml <<EOF
+
+          apiVersion: kustomize.config.k8s.io/v1beta1
+
+          kind: Kustomization
+
+          resources:
+            - ../../base
+
+          images:
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice
+              newName: ${ECR_REGISTRY}/adservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice
+              newName: ${ECR_REGISTRY}/cartservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice
+              newName: ${ECR_REGISTRY}/checkoutservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice
+              newName: ${ECR_REGISTRY}/currencyservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice
+              newName: ${ECR_REGISTRY}/emailservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend
+              newName: ${ECR_REGISTRY}/frontend
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator
+              newName: ${ECR_REGISTRY}/loadgenerator
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice
+              newName: ${ECR_REGISTRY}/paymentservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice
+              newName: ${ECR_REGISTRY}/productcatalogservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice
+              newName: ${ECR_REGISTRY}/recommendationservice
+              newTag: ${IMAGE_TAG}
+
+            - name: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice
+              newName: ${ECR_REGISTRY}/shippingservice
+              newTag: ${IMAGE_TAG}
+
+          EOF
+
+          echo ""
+          echo "Generated kustomization.yaml:"
+          cat kustomize/overlays/aws-ecr/kustomization.yaml
+
+      # ========================================================
+      # VALIDATE MANIFESTS
+      # ========================================================
+
+      - name: Validate Kubernetes manifests
+        run: |
+
+          echo "======================================"
+          echo "KUSTOMIZE BUILD"
+          echo "======================================"
+
+          kustomize build kustomize/overlays/aws-ecr \
+            > /tmp/manifests.yaml
+
+          echo ""
+          echo "======================================"
+          echo "CONTAINER IMAGES"
+          echo "======================================"
+
+          grep "image:" /tmp/manifests.yaml
+
+      # ========================================================
+      # DEPLOY
+      # ========================================================
+
+      - name: Deploy to EKS
+        run: |
+
+          echo "======================================"
+          echo "DEPLOYING TO EKS"
+          echo "======================================"
+
+          kubectl apply \
+            -k kustomize/overlays/aws-ecr \
+            --namespace default
+
+          echo ""
+          echo "Deployment successfully applied."
+
+      # ========================================================
+      # WAIT FOR ROLLOUT
+      # ========================================================
+
+      - name: Wait for deployments
+        run: |
+
+          DEPLOYMENTS=(
+            adservice
+            cartservice
+            checkoutservice
+            currencyservice
+            emailservice
+            frontend
+            loadgenerator
+            paymentservice
+            productcatalogservice
+            recommendationservice
+            shippingservice
+          )
+
+          for DEPLOYMENT in "${DEPLOYMENTS[@]}"
+          do
+
+            echo ""
+            echo "======================================"
+            echo "WAITING FOR: $DEPLOYMENT"
+            echo "======================================"
+
+            kubectl rollout status \
+              deployment/"$DEPLOYMENT" \
+              --timeout=5m
+
+          done
+
+          echo ""
+          echo "All deployments are ready."
+
+      # ========================================================
+      # CLUSTER STATUS
+      # ========================================================
+
+      - name: Show cluster status
+        run: |
+
+          echo "======================================"
+          echo "NODES"
+          echo "======================================"
+
+          kubectl get nodes
+
+          echo ""
+          echo "======================================"
+          echo "PODS"
+          echo "======================================"
+
+          kubectl get pods -o wide
+
+          echo ""
+          echo "======================================"
+          echo "SERVICES"
+          echo "======================================"
+
+          kubectl get services
+
+      # ========================================================
+      # GET APPLICATION URL
+      # ========================================================
+
+      - name: Get application URL
+        run: |
+
+          echo "======================================"
+          echo "WAITING FOR LOAD BALANCER"
+          echo "======================================"
+
+          FRONTEND_URL=""
+
+          for i in {1..30}
+          do
+
+            FRONTEND_URL=$(kubectl get service frontend-external \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' \
+              2>/dev/null || true)
+
+            if [ -n "$FRONTEND_URL" ]; then
+              break
+            fi
+
+            echo "LoadBalancer not ready yet..."
+            sleep 10
+
+          done
+
+          if [ -n "$FRONTEND_URL" ]; then
+
+            echo ""
+            echo "======================================"
+            echo "APPLICATION URL"
+            echo "======================================"
+
+            echo "http://$FRONTEND_URL"
+
+            echo ""
+            echo "FRONTEND_URL=http://$FRONTEND_URL" \
+              >> "$GITHUB_ENV"
+
+          else
+
+            echo ""
+            echo "LoadBalancer hostname not available yet."
+
+            kubectl get service frontend-external
+
+          fi
+
+      # ========================================================
+      # GITHUB SUMMARY
+      # ========================================================
+
+      - name: Deployment summary
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
+        run: |
+
+          echo "# 🚀 Deployment Report" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Image Tag" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "\`$IMAGE_TAG\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## EKS Cluster" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "\`$EKS_CLUSTER\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## AWS Region" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "\`$AWS_REGION\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Pods" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          kubectl get pods \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Services" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          kubectl get services \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo '```' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Application" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${FRONTEND_URL:-}" ]; then
+
+            echo "http://${FRONTEND_URL}" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          else
+
+            echo "LoadBalancer URL not available yet." \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          fi
