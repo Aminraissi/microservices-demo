@@ -33,10 +33,10 @@ namespace cartservice
 
             if (!string.IsNullOrEmpty(redisAddress))
             {
-                services.AddStackExchangeRedisCache(options =>
-                {
-                    options.Configuration = redisAddress;
-                });
+               services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = redisAddress + ",ssl=True,abortConnect=False";
+});
                 services.AddSingleton<ICartStore, RedisCartStore>();
             }
             else if (!string.IsNullOrEmpty(spannerProjectId) || !string.IsNullOrEmpty(spannerConnectionString))
