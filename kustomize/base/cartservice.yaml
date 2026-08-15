@@ -48,7 +48,7 @@ spec:
         - containerPort: 7070
         env:
         - name: REDIS_ADDR
-          value: "redis-cart:6379"
+          value: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379"
         resources:
           requests:
             cpu: 200m
