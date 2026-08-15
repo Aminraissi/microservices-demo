@@ -19,11 +19,15 @@ env:
 
 jobs:
 
+  # ============================================================
+  # BUILD AND PUSH
+  # ============================================================
   build-and-push:
     name: Build and Push Images
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -34,7 +38,8 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -43,6 +48,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Set Image Tag
+        shell: bash
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
@@ -67,22 +73,31 @@ jobs:
           )
 
           for SERVICE in "${SERVICES[@]}"; do
+
             echo "======================================"
             echo "BUILDING: $SERVICE"
             echo "======================================"
 
+            # Default configuration
             CONTEXT="src/$SERVICE"
             DOCKERFILE="$CONTEXT/Dockerfile"
 
+            # cartservice has a different Dockerfile/context
             if [ "$SERVICE" = "cartservice" ]; then
               CONTEXT="src/cartservice/src"
               DOCKERFILE="src/cartservice/src/Dockerfile"
             fi
 
             echo "Dockerfile: $DOCKERFILE"
-            echo "Context: $CONTEXT"
+            echo "Context:    $CONTEXT"
 
+            # Verify Dockerfile
             test -f "$DOCKERFILE"
+
+            # Verify cartservice project file
+            if [ "$SERVICE" = "cartservice" ]; then
+              test -f "$CONTEXT/cartservice.csproj"
+            fi
 
             docker buildx build \
               --platform linux/amd64 \
@@ -92,15 +107,22 @@ jobs:
               --push \
               "$CONTEXT"
 
-            echo "Successfully pushed $SERVICE"
+            echo "Successfully pushed:"
+            echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
           done
 
+
+  # ============================================================
+  # DEPLOY TO EKS
+  # ============================================================
   deploy:
     name: Deploy to EKS
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -111,55 +133,107 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
+
+      # --------------------------------------------------------
+      # EKS CHECK
+      # --------------------------------------------------------
 
       - name: Verify EKS Cluster
         run: |
+          echo "======================================"
+          echo "VERIFYING EKS CLUSTER"
+          echo "======================================"
+
           aws eks describe-cluster \
             --name "$EKS_CLUSTER" \
             --region "$AWS_REGION" \
             --query 'cluster.status' \
             --output text
 
+      # --------------------------------------------------------
+      # KUBECTL
+      # --------------------------------------------------------
+
       - name: Install kubectl
+        shell: bash
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+
+          curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+
           chmod +x kubectl
+
           sudo mv kubectl /usr/local/bin/kubectl
+
           kubectl version --client
 
+      # --------------------------------------------------------
+      # KUSTOMIZE
+      # --------------------------------------------------------
+
       - name: Install Kustomize
+        shell: bash
         run: |
           KUSTOMIZE_VERSION="v5.7.1"
 
           curl -L \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_v5.7.1_linux_amd64.tar.gz" \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
             -o /tmp/kustomize.tar.gz
 
           tar -xzf /tmp/kustomize.tar.gz -C /tmp
+
           sudo mv /tmp/kustomize /usr/local/bin/kustomize
 
           kustomize version
 
+      # --------------------------------------------------------
+      # EKS KUBECONFIG
+      # --------------------------------------------------------
+
       - name: Configure kubectl for EKS
         run: |
+          echo "======================================"
+          echo "CONFIGURING EKS"
+          echo "======================================"
+
           aws eks update-kubeconfig \
             --region "$AWS_REGION" \
             --name "$EKS_CLUSTER"
 
+          echo "Cluster:"
           kubectl cluster-info
+
+          echo ""
+          echo "Nodes:"
           kubectl get nodes -o wide
 
+      # --------------------------------------------------------
+      # IMAGE TAG
+      # --------------------------------------------------------
+
       - name: Set Image Tag
+        shell: bash
         run: |
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+
           echo "IMAGE TAG: $IMAGE_TAG"
+
+      # --------------------------------------------------------
+      # UPDATE IMAGES
+      # --------------------------------------------------------
 
       - name: Update Kubernetes Images
         shell: bash
         run: |
           set -e
+
+          echo "======================================"
+          echo "UPDATING KUBERNETES IMAGES"
+          echo "======================================"
 
           SERVICES=(
             adservice
@@ -175,37 +249,76 @@ jobs:
           )
 
           for SERVICE in "${SERVICES[@]}"; do
-            echo "Updating $SERVICE"
+
+            echo "Updating image for $SERVICE"
 
             kustomize edit set image \
               "$ECR_REGISTRY/$SERVICE=$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
           done
 
+          echo ""
+          echo "Generated kustomization.yaml:"
           cat kustomization.yaml
 
+      # --------------------------------------------------------
+      # VALIDATE MANIFESTS
+      # --------------------------------------------------------
+
       - name: Validate Kubernetes Manifests
+        shell: bash
         run: |
+          set -e
+
+          echo "======================================"
+          echo "VALIDATING MANIFESTS"
+          echo "======================================"
+
           kustomize build . > /tmp/rendered.yaml
 
           kubectl apply \
             --dry-run=client \
             -f /tmp/rendered.yaml
 
+          echo "Manifest validation successful."
+
+      # --------------------------------------------------------
+      # DEPLOY
+      # --------------------------------------------------------
+
       - name: Deploy to EKS
+        shell: bash
         run: |
+          set -e
+
           echo "======================================"
           echo "DEPLOYING TO EKS"
           echo "======================================"
 
           kustomize build . | kubectl apply -f -
 
+      # --------------------------------------------------------
+      # STATUS
+      # --------------------------------------------------------
+
       - name: Show Deployment Status
+        shell: bash
         run: |
+          echo "======================================"
+          echo "DEPLOYMENT STATUS"
+          echo "======================================"
+
           kubectl get deployments
+
           echo ""
           kubectl get pods -o wide
+
           echo ""
           kubectl get services
+
+      # --------------------------------------------------------
+      # WAIT FOR DEPLOYMENTS
+      # --------------------------------------------------------
 
       - name: Wait for Deployments
         shell: bash
@@ -228,7 +341,10 @@ jobs:
           FAILED=0
 
           for DEPLOYMENT in "${DEPLOYMENTS[@]}"; do
-            echo "Waiting for $DEPLOYMENT..."
+
+            echo "======================================"
+            echo "Waiting for $DEPLOYMENT"
+            echo "======================================"
 
             kubectl rollout status \
               deployment/"$DEPLOYMENT" \
@@ -240,26 +356,44 @@ jobs:
             else
               echo "READY: $DEPLOYMENT"
             fi
+
           done
 
-          if [ $FAILED -ne 0 ]; then
+          if [ "$FAILED" -ne 0 ]; then
             exit 1
           fi
 
+      # --------------------------------------------------------
+      # DIAGNOSTICS
+      # --------------------------------------------------------
+
       - name: Diagnostics
         if: always()
+        shell: bash
         run: |
           echo "======================================"
           echo "FINAL CLUSTER STATUS"
           echo "======================================"
 
+          echo ""
+          echo "NODES:"
           kubectl get nodes -o wide || true
+
           echo ""
+          echo "PODS:"
           kubectl get pods -o wide || true
+
           echo ""
-          kubectl get services || true
-          echo ""
+          echo "DEPLOYMENTS:"
           kubectl get deployments || true
+
           echo ""
-          kubectl get events --sort-by='.lastTimestamp' | tail -100 || true
+          echo "SERVICES:"
+          kubectl get services || true
+
+          echo ""
+          echo "RECENT EVENTS:"
+          kubectl get events \
+            --sort-by='.lastTimestamp' \
+            | tail -100 || true
 ```
