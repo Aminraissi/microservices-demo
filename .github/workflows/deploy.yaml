@@ -30,6 +30,7 @@ jobs:
     outputs:
       services: ${{ steps.detect.outputs.services }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
+      manifests_changed: ${{ steps.detect.outputs.manifests_changed }}
 
     steps:
 
@@ -42,11 +43,8 @@ jobs:
         id: detect
         shell: bash
         run: |
-          set -e
 
-          echo "======================================"
-          echo "DETECTING CHANGES"
-          echo "======================================"
+          set -e
 
           SERVICES=(
             adservice
@@ -63,108 +61,74 @@ jobs:
 
           CHANGED_SERVICES=()
 
-          # ------------------------------------------------------
-          # workflow_dispatch = rebuild everything
-          # ------------------------------------------------------
+          echo "======================================"
+          echo "CHECKING CHANGED FILES"
+          echo "======================================"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          git diff --name-only HEAD^ HEAD
 
-            echo "Manual workflow execution detected."
-            echo "Building all services."
+          for SERVICE in "${SERVICES[@]}"; do
 
-            CHANGED_SERVICES=("${SERVICES[@]}")
-
-          else
-
-            # ----------------------------------------------------
-            # Get changed files
-            # ----------------------------------------------------
-
-            git diff --name-only HEAD^ HEAD > /tmp/changed-files.txt
-
-            echo ""
-            echo "Changed files:"
-            cat /tmp/changed-files.txt
-
-            # ----------------------------------------------------
-            # Detect services
-            # ----------------------------------------------------
-
-            for SERVICE in "${SERVICES[@]}"; do
-
-              if grep -q "^src/$SERVICE/" /tmp/changed-files.txt; then
-                CHANGED_SERVICES+=("$SERVICE")
-                continue
-              fi
-
-              # cartservice special case
-              if [ "$SERVICE" = "cartservice" ]; then
-                if grep -q "^src/cartservice/" /tmp/changed-files.txt; then
-                  CHANGED_SERVICES+=("$SERVICE")
-                fi
-              fi
-
-            done
-
-            # ----------------------------------------------------
-            # Dockerfile / shared files
-            # ----------------------------------------------------
-
-            if grep -qE '^\.github/|^kustomization.yaml$|^base/|^manifests/' \
-              /tmp/changed-files.txt; then
-
-              echo ""
-              echo "Infrastructure/manifest files changed."
-              echo "No image rebuild is required unless service code changed."
-
+            if git diff --quiet HEAD^ HEAD -- "src/$SERVICE"; then
+              echo "UNCHANGED: $SERVICE"
+            else
+              echo "CHANGED:   $SERVICE"
+              CHANGED_SERVICES+=("$SERVICE")
             fi
 
+          done
+
+          # cartservice special structure
+          if git diff --quiet HEAD^ HEAD -- "src/cartservice"; then
+            :
+          else
+            if [[ ! " ${CHANGED_SERVICES[*]} " =~ " cartservice " ]]; then
+              CHANGED_SERVICES+=("cartservice")
+            fi
           fi
 
-          # ------------------------------------------------------
-          # Remove duplicates
-          # ------------------------------------------------------
+          # Convert to JSON
+          if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
 
-          if [ "${#CHANGED_SERVICES[@]}" -gt 0 ]; then
-
-            UNIQUE_SERVICES=(
-              $(printf "%s\n" "${CHANGED_SERVICES[@]}" | sort -u)
-            )
+            SERVICES_JSON="[]"
+            HAS_CHANGES="false"
 
           else
 
-            UNIQUE_SERVICES=()
+            SERVICES_JSON=$(printf '%s\n' "${CHANGED_SERVICES[@]}" \
+              | jq -R . \
+              | jq -sc .)
+
+            HAS_CHANGES="true"
 
           fi
 
-          # ------------------------------------------------------
-          # Output JSON
-          # ------------------------------------------------------
+          # Check Kubernetes changes
+          if git diff --quiet HEAD^ HEAD -- \
+            kustomization.yaml \
+            kubernetes/ \
+            k8s/ \
+            manifests/; then
 
-          if [ "${#UNIQUE_SERVICES[@]}" -eq 0 ]; then
-
-            echo ""
-            echo "No service code changed."
-            echo "No Docker images need to be rebuilt."
-
-            echo 'services=[]' >> "$GITHUB_OUTPUT"
-            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+            MANIFESTS_CHANGED="false"
 
           else
 
-            SERVICES_JSON=$(
-              printf '%s\n' "${UNIQUE_SERVICES[@]}" |
-              jq -R -s -c 'split("\n") | map(select(length > 0))'
-            )
-
-            echo ""
-            echo "Services that changed:"
-            echo "$SERVICES_JSON"
-
-            echo "services=$SERVICES_JSON" >> "$GITHUB_OUTPUT"
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            MANIFESTS_CHANGED="true"
 
           fi
+
+          echo ""
+          echo "Changed services:"
+          echo "$SERVICES_JSON"
+
+          echo ""
+          echo "Has image changes: $HAS_CHANGES"
+          echo "Manifests changed: $MANIFESTS_CHANGED"
+
+          echo "services=$SERVICES_JSON" >> "$GITHUB_OUTPUT"
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+          echo "manifests_changed=$MANIFESTS_CHANGED" >> "$GITHUB_OUTPUT"
 
 
   # ============================================================
@@ -174,14 +138,10 @@ jobs:
   build-and-push:
     name: Build and Push Changed Images
     runs-on: ubuntu-latest
+
     needs: detect-changes
 
     if: needs.detect-changes.outputs.has_changes == 'true'
-
-    strategy:
-      fail-fast: false
-      matrix:
-        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
 
     steps:
 
@@ -194,6 +154,10 @@ jobs:
           role-to-assume: arn:aws:iam::501161805281:role/test
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -203,52 +167,66 @@ jobs:
       - name: Set Image Tag
         shell: bash
         run: |
+
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
 
-          echo "Building:"
-          echo "${{ matrix.service }}:$IMAGE_TAG"
+          echo "IMAGE TAG: $IMAGE_TAG"
 
-      - name: Build and Push Image
+      - name: Build and Push Changed Images
         shell: bash
+        env:
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
+
         run: |
+
           set -e
 
-          SERVICE="${{ matrix.service }}"
-
           echo "======================================"
-          echo "BUILDING: $SERVICE"
+          echo "BUILDING CHANGED SERVICES ONLY"
           echo "======================================"
 
-          CONTEXT="src/$SERVICE"
-          DOCKERFILE="$CONTEXT/Dockerfile"
+          echo "Services:"
+          echo "$CHANGED_SERVICES"
 
-          # cartservice special configuration
-          if [ "$SERVICE" = "cartservice" ]; then
-            CONTEXT="src/cartservice/src"
-            DOCKERFILE="src/cartservice/src/Dockerfile"
-          fi
+          mapfile -t SERVICES < <(
+            echo "$CHANGED_SERVICES" | jq -r '.[]'
+          )
 
-          echo "Dockerfile: $DOCKERFILE"
-          echo "Context:    $CONTEXT"
+          for SERVICE in "${SERVICES[@]}"; do
 
-          test -f "$DOCKERFILE"
+            echo ""
+            echo "======================================"
+            echo "BUILDING: $SERVICE"
+            echo "======================================"
 
-          if [ "$SERVICE" = "cartservice" ]; then
-            test -f "$CONTEXT/cartservice.csproj"
-          fi
+            CONTEXT="src/$SERVICE"
+            DOCKERFILE="$CONTEXT/Dockerfile"
 
-          docker buildx build \
-            --platform linux/amd64 \
-            --file "$DOCKERFILE" \
-            --tag "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG" \
-            --push \
-            "$CONTEXT"
+            if [ "$SERVICE" = "cartservice" ]; then
+              CONTEXT="src/cartservice/src"
+              DOCKERFILE="src/cartservice/src/Dockerfile"
+            fi
 
-          echo ""
-          echo "Successfully pushed:"
-          echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+            echo "Dockerfile: $DOCKERFILE"
+            echo "Context:    $CONTEXT"
+
+            test -f "$DOCKERFILE"
+
+            docker buildx build \
+              --platform linux/amd64 \
+              --file "$DOCKERFILE" \
+              --tag "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG" \
+              --tag "$ECR_REGISTRY/$SERVICE:latest" \
+              --push \
+              "$CONTEXT"
+
+            echo ""
+            echo "Successfully pushed:"
+            echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
+          done
 
 
   # ============================================================
@@ -263,15 +241,13 @@ jobs:
       - detect-changes
       - build-and-push
 
-    # Execute even when build-and-push was skipped
     if: |
       always() &&
-      needs.detect-changes.result == 'success' &&
       (
         needs.detect-changes.outputs.has_changes == 'true' ||
-        needs.build-and-push.result == 'skipped'
-      )
-
+        needs.detect-changes.outputs.manifests_changed == 'true'
+      ) &&
+      needs.build-and-push.result != 'failure'
     steps:
 
       - name: Checkout
@@ -291,63 +267,10 @@ jobs:
       # EKS
       # ========================================================
 
-      - name: Verify EKS Cluster
-        run: |
-          aws eks describe-cluster \
-            --name "$EKS_CLUSTER" \
-            --region "$AWS_REGION" \
-            --query 'cluster.status' \
-            --output text
-
-      - name: Install kubectl
+      - name: Configure kubectl
         shell: bash
         run: |
-          set -e
 
-          KUBECTL_VERSION=$(curl -L -s \
-            https://dl.k8s.io/release/stable.txt)
-
-          curl -LO \
-            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-
-          chmod +x kubectl
-
-          sudo mv kubectl /usr/local/bin/kubectl
-
-          kubectl version --client
-
-      # ========================================================
-      # KUSTOMIZE
-      # ========================================================
-
-      - name: Install Kustomize
-        shell: bash
-        run: |
-          set -e
-
-          KUSTOMIZE_VERSION="v5.7.1"
-
-          curl -L \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
-            -o /tmp/kustomize.tar.gz
-
-          mkdir -p /tmp/kustomize
-
-          tar -xzf /tmp/kustomize.tar.gz \
-            -C /tmp/kustomize
-
-          sudo install \
-            /tmp/kustomize/kustomize \
-            /usr/local/bin/kustomize
-
-          kustomize version
-
-      # ========================================================
-      # CONFIGURE KUBECTL
-      # ========================================================
-
-      - name: Configure kubectl for EKS
-        run: |
           set -e
 
           aws eks update-kubeconfig \
@@ -356,67 +279,103 @@ jobs:
 
           kubectl cluster-info
 
-          echo ""
           kubectl get nodes -o wide
 
       # ========================================================
-      # UPDATE IMAGES
+      # INSTALL KUSTOMIZE
       # ========================================================
 
-      - name: Update Kubernetes Images
+      - name: Install Kustomize
         shell: bash
         run: |
+
           set -e
 
-          IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+          KUSTOMIZE_VERSION="v5.7.1"
+
+          curl -L \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            -o /tmp/kustomize.tar.gz
+
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+
+          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+
+          kustomize version
+
+      # ========================================================
+      # UPDATE ONLY CHANGED IMAGES
+      # ========================================================
+
+      - name: Update Changed Kubernetes Images
+        shell: bash
+        env:
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
+
+        run: |
+
+          set -e
 
           echo "======================================"
           echo "UPDATING KUBERNETES IMAGES"
           echo "======================================"
 
-          SERVICES=(
-            adservice
-            cartservice
-            checkoutservice
-            currencyservice
-            emailservice
-            frontend
-            paymentservice
-            productcatalogservice
-            recommendationservice
-            shippingservice
-          )
+          # Find kustomization.yaml
+          KUSTOMIZATION_FILE=$(find . -name kustomization.yaml -type f | head -1)
 
-          # ------------------------------------------------------
-          # Only change images that were rebuilt
-          # ------------------------------------------------------
+          if [ -z "$KUSTOMIZATION_FILE" ]; then
+            echo "ERROR: kustomization.yaml not found"
+            exit 1
+          fi
 
-          if [ "${{ needs.detect-changes.outputs.has_changes }}" = "true" ]; then
+          KUSTOMIZATION_DIR=$(dirname "$KUSTOMIZATION_FILE")
 
-            CHANGED='${{ needs.detect-changes.outputs.services }}'
+          echo "Kustomization:"
+          echo "$KUSTOMIZATION_FILE"
 
-            echo "Changed services:"
-            echo "$CHANGED"
+          cd "$KUSTOMIZATION_DIR"
 
-            for SERVICE in $(echo "$CHANGED" | jq -r '.[]'); do
+          echo ""
+          echo "Current directory:"
+          pwd
+
+          echo ""
+          echo "Current kustomization:"
+          cat kustomization.yaml
+
+          if [ "$CHANGED_SERVICES" = "[]" ]; then
+
+            echo ""
+            echo "No service images changed."
+            echo "Keeping existing image versions."
+
+          else
+
+            mapfile -t SERVICES < <(
+              echo "$CHANGED_SERVICES" | jq -r '.[]'
+            )
+
+            # Build image tag from this workflow
+            IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+
+            for SERVICE in "${SERVICES[@]}"; do
 
               echo ""
-              echo "Updating $SERVICE"
+              echo "Updating image:"
+              echo "$SERVICE:$IMAGE_TAG"
 
               kustomize edit set image \
                 "$ECR_REGISTRY/$SERVICE=$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
 
             done
 
-          else
-
-            echo "No service images changed."
-            echo "Keeping existing image versions."
-
           fi
 
           echo ""
-          echo "Final kustomization.yaml:"
+          echo "======================================"
+          echo "FINAL KUSTOMIZATION"
+          echo "======================================"
+
           cat kustomization.yaml
 
       # ========================================================
@@ -426,7 +385,15 @@ jobs:
       - name: Validate Kubernetes Manifests
         shell: bash
         run: |
+
           set -e
+
+          KUSTOMIZATION_FILE=$(find . -name kustomization.yaml -type f | head -1)
+          KUSTOMIZATION_DIR=$(dirname "$KUSTOMIZATION_FILE")
+
+          cd "$KUSTOMIZATION_DIR"
+
+          echo "Building manifests..."
 
           kustomize build . > /tmp/rendered.yaml
 
@@ -443,7 +410,13 @@ jobs:
       - name: Deploy to EKS
         shell: bash
         run: |
+
           set -e
+
+          KUSTOMIZATION_FILE=$(find . -name kustomization.yaml -type f | head -1)
+          KUSTOMIZATION_DIR=$(dirname "$KUSTOMIZATION_FILE")
+
+          cd "$KUSTOMIZATION_DIR"
 
           echo "======================================"
           echo "DEPLOYING TO EKS"
@@ -456,7 +429,9 @@ jobs:
       # ========================================================
 
       - name: Show Deployment Status
+        shell: bash
         run: |
+
           echo "======================================"
           echo "DEPLOYMENT STATUS"
           echo "======================================"
@@ -476,6 +451,7 @@ jobs:
       - name: Wait for Deployments
         shell: bash
         run: |
+
           set +e
 
           DEPLOYMENTS=(
@@ -503,10 +479,17 @@ jobs:
               --timeout=5m
 
             if [ $? -ne 0 ]; then
+
               echo "FAILED: $DEPLOYMENT"
+
+              kubectl describe deployment "$DEPLOYMENT" || true
+
               FAILED=1
+
             else
+
               echo "READY: $DEPLOYMENT"
+
             fi
 
           done
@@ -523,6 +506,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+
           echo "======================================"
           echo "FINAL CLUSTER STATUS"
           echo "======================================"
