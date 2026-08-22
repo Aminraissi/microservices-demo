@@ -200,17 +200,17 @@ shippingService:
 cartDatabase:
   type: redis
   connectionString: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379"
-  
+
   inClusterRedis:
     create: false
     name: redis-cart
     publicRepository: true
 
   externalRedisTlsOrigination:
-    enable: true
-    name: external-redis-tls-origination
-    endpointAddress: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com"
-    endpointPort: "6379"
+    enable: false
+    name: exernal-redis-tls-origination
+    endpointAddress: ""
+    endpointPort: ""
     certificate: ""
 
 # @TODO: This service is not currently available in Helm.
