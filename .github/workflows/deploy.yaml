@@ -43,6 +43,7 @@ jobs:
         id: detect
         shell: bash
         run: |
+
           set -e
 
           SERVICES=(
@@ -67,18 +68,31 @@ jobs:
           git diff --name-only HEAD^ HEAD
 
           for SERVICE in "${SERVICES[@]}"; do
+
             if git diff --quiet HEAD^ HEAD -- "src/$SERVICE"; then
+
               echo "UNCHANGED: $SERVICE"
+
             else
+
               echo "CHANGED:   $SERVICE"
               CHANGED_SERVICES+=("$SERVICE")
+
             fi
+
           done
 
+          # ======================================================
+          # CONVERT TO JSON
+          # ======================================================
+
           if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
+
             SERVICES_JSON="[]"
             HAS_CHANGES="false"
+
           else
+
             SERVICES_JSON=$(
               printf '%s\n' "${CHANGED_SERVICES[@]}" |
               jq -R . |
@@ -86,19 +100,26 @@ jobs:
             )
 
             HAS_CHANGES="true"
+
           fi
 
-          # Helm/chart/values changes must trigger deployment
-          # even when no application image changed.
+          # ======================================================
+          # KUBERNETES CHANGES
+          # ======================================================
+
           if git diff --quiet HEAD^ HEAD -- \
-            Chart.yaml \
-            values.yaml \
-            helm/ \
-            helm-chart/ \
-            charts/; then
+            kustomization.yaml \
+            kustomize/ \
+            kubernetes/ \
+            k8s/ \
+            manifests/; then
+
             MANIFESTS_CHANGED="false"
+
           else
+
             MANIFESTS_CHANGED="true"
+
           fi
 
           echo ""
@@ -109,7 +130,7 @@ jobs:
           echo "Has image changes: $HAS_CHANGES"
 
           echo ""
-          echo "Helm/chart changes: $MANIFESTS_CHANGED"
+          echo "Kubernetes changes: $MANIFESTS_CHANGED"
 
           echo "services=$SERVICES_JSON" >> "$GITHUB_OUTPUT"
           echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
@@ -134,7 +155,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ========================================================
-      # AWS CREDENTIALS - KEEP THE WORKING ROLE
+      # AWS CREDENTIALS - KEEP WORKING ROLE
       # ========================================================
 
       - name: Configure AWS Credentials
@@ -148,14 +169,14 @@ jobs:
           aws sts get-caller-identity
 
       # ========================================================
-      # ECR LOGIN
+      # ECR
       # ========================================================
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
       # ========================================================
-      # DOCKER BUILDX
+      # BUILDX
       # ========================================================
 
       - name: Set up Docker Buildx
@@ -168,6 +189,7 @@ jobs:
       - name: Set Image Tag
         shell: bash
         run: |
+
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
@@ -185,7 +207,9 @@ jobs:
         shell: bash
         env:
           CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
+
         run: |
+
           set -e
 
           echo "======================================"
@@ -206,10 +230,12 @@ jobs:
             CONTEXT="src/$SERVICE"
             DOCKERFILE="$CONTEXT/Dockerfile"
 
-            # Cartservice has a different Docker build structure.
+            # Cartservice special structure
             if [ "$SERVICE" = "cartservice" ]; then
+
               CONTEXT="src/cartservice/src"
               DOCKERFILE="src/cartservice/src/Dockerfile"
+
             fi
 
             echo "Dockerfile: $DOCKERFILE"
@@ -233,7 +259,7 @@ jobs:
 
 
   # ============================================================
-  # DEPLOY TO EKS WITH HELM
+  # DEPLOY TO EKS
   # ============================================================
 
   deploy:
@@ -254,15 +280,11 @@ jobs:
 
     steps:
 
-      # ========================================================
-      # CHECKOUT
-      # ========================================================
-
       - name: Checkout
         uses: actions/checkout@v4
 
       # ========================================================
-      # AWS - KEEP THE WORKING ROLE
+      # AWS
       # ========================================================
 
       - name: Configure AWS Credentials
@@ -282,6 +304,7 @@ jobs:
       - name: Configure kubectl
         shell: bash
         run: |
+
           set -e
 
           aws eks update-kubeconfig \
@@ -293,44 +316,61 @@ jobs:
           echo "======================================"
 
           kubectl cluster-info
+
+          echo ""
           kubectl get nodes -o wide
 
       # ========================================================
-      # HELM
+      # INSTALL KUSTOMIZE
       # ========================================================
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      # ========================================================
-      # FIND HELM CHART
-      # ========================================================
-
-      - name: Find Helm Chart
+      - name: Install Kustomize
         shell: bash
         run: |
+
           set -e
 
-          CHART_FILE=$(find . \
-            -name Chart.yaml \
+          KUSTOMIZE_VERSION="v5.7.1"
+
+          curl -L \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            -o /tmp/kustomize.tar.gz
+
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+
+          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+
+          kustomize version
+
+      # ========================================================
+      # FIND KUSTOMIZATION
+      # ========================================================
+
+      - name: Find Kustomization
+        shell: bash
+        run: |
+
+          set -e
+
+          KUSTOMIZATION_FILE=$(find . \
+            -name kustomization.yaml \
             -type f \
             | head -1)
 
-          if [ -z "$CHART_FILE" ]; then
-            echo "ERROR: Chart.yaml not found"
+          if [ -z "$KUSTOMIZATION_FILE" ]; then
+
+            echo "ERROR: kustomization.yaml not found"
             exit 1
+
           fi
 
-          HELM_CHART_DIR=$(dirname "$CHART_FILE")
+          KUSTOMIZATION_DIR=$(dirname "$KUSTOMIZATION_FILE")
 
-          echo "HELM_CHART_DIR=$HELM_CHART_DIR" >> "$GITHUB_ENV"
+          echo "KUSTOMIZATION_FILE=$KUSTOMIZATION_FILE" >> "$GITHUB_ENV"
+          echo "KUSTOMIZATION_DIR=$KUSTOMIZATION_DIR" >> "$GITHUB_ENV"
 
-          echo "Found Helm chart:"
-          echo "$HELM_CHART_DIR"
-
-          echo ""
-          echo "Chart:"
-          cat "$CHART_FILE"
+          echo "Found:"
+          echo "$KUSTOMIZATION_FILE"
 
       # ========================================================
       # IMAGE TAG
@@ -339,6 +379,7 @@ jobs:
       - name: Set Image Tag
         shell: bash
         run: |
+
           IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
@@ -347,145 +388,128 @@ jobs:
           echo "$IMAGE_TAG"
 
       # ========================================================
-      # VERIFY VALUES.YAML
+      # UPDATE ONLY CHANGED IMAGES
       # ========================================================
 
-      - name: Verify values.yaml
+      - name: Update Changed Kubernetes Images
         shell: bash
+        env:
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
+
         run: |
+
           set -e
 
-          VALUES_FILE="$HELM_CHART_DIR/values.yaml"
+          cd "$KUSTOMIZATION_DIR"
 
-          if [ ! -f "$VALUES_FILE" ]; then
-            echo "ERROR: values.yaml not found at $VALUES_FILE"
-            exit 1
+          echo "======================================"
+          echo "UPDATING KUBERNETES IMAGES"
+          echo "======================================"
+
+          if [ "$CHANGED_SERVICES" = "[]" ]; then
+
+            echo "No service images changed."
+
+          else
+
+            mapfile -t SERVICES < <(
+              echo "$CHANGED_SERVICES" | jq -r '.[]'
+            )
+
+            for SERVICE in "${SERVICES[@]}"; do
+
+              echo ""
+              echo "Updating:"
+              echo "$SERVICE:$IMAGE_TAG"
+
+              kustomize edit set image \
+                "$ECR_REGISTRY/$SERVICE=$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
+            done
+
           fi
 
+          echo ""
           echo "======================================"
-          echo "values.yaml"
+          echo "FINAL KUSTOMIZATION"
           echo "======================================"
 
-          cat "$VALUES_FILE"
+          cat kustomization.yaml
 
       # ========================================================
-      # RENDER HELM
+      # VALIDATE
       # ========================================================
 
-      - name: Render Helm manifests
+      - name: Validate Kubernetes Manifests
         shell: bash
         run: |
+
           set -e
 
+          cd "$KUSTOMIZATION_DIR"
+
           echo "======================================"
-          echo "HELM TEMPLATE"
+          echo "BUILDING MANIFESTS"
           echo "======================================"
 
-          helm template onlineboutique "$HELM_CHART_DIR" \
-            --set images.repository="$ECR_REGISTRY" \
-            --set images.tag="$IMAGE_TAG" \
-            --set cartDatabase.type=redis \
-            --set-string cartDatabase.connectionString="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True" \
-            --set cartDatabase.inClusterRedis.create=false \
-            --set cartDatabase.externalRedisTlsOrigination.enable=false \
-            > /tmp/rendered.yaml
+          kustomize build . > /tmp/rendered.yaml
+
+          kubectl apply \
+            --dry-run=client \
+            -f /tmp/rendered.yaml
 
           echo ""
-          echo "Checking REDIS_ADDR / Redis configuration..."
+          echo "Manifest validation successful."
 
-          grep -A5 -B2 "REDIS_ADDR" /tmp/rendered.yaml || true
+      # ========================================================
+      # DEPLOY
+      # ========================================================
+
+      - name: Deploy to EKS
+        shell: bash
+        run: |
+
+          set -e
+
+          cd "$KUSTOMIZATION_DIR"
+
+          echo "======================================"
+          echo "DEPLOYING TO EKS"
+          echo "======================================"
+
+          kustomize build . | kubectl apply -f -
 
           echo ""
-          echo "Checking frontend image..."
-
-          grep -A2 "name: frontend" /tmp/rendered.yaml | head -20 || true
+          echo "Deployment applied."
 
       # ========================================================
-      # HELM DEPLOY
+      # WAIT FOR CARTSERVICE
       # ========================================================
 
-      - name: Deploy with Helm
-        shell: bash
+      - name: Wait for cartservice
         run: |
-          set -e
-
-          echo "======================================"
-          echo "DEPLOYING WITH HELM"
-          echo "======================================"
-
-          helm upgrade --install onlineboutique "$HELM_CHART_DIR" \
-            --namespace default \
-            --set images.repository="$ECR_REGISTRY" \
-            --set images.tag="$IMAGE_TAG" \
-            --set cartDatabase.type=redis \
-            --set-string cartDatabase.connectionString="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True" \
-            --set cartDatabase.inClusterRedis.create=false \
-            --set cartDatabase.externalRedisTlsOrigination.enable=false \
-            --wait \
-            --timeout 10m
-
-      # ========================================================
-      # VERIFY CARTSERVICE REDIS
-      # ========================================================
-
-      - name: Verify Cartservice Redis Configuration
-        shell: bash
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "VERIFYING CARTSERVICE"
-          echo "======================================"
 
           kubectl rollout status \
             deployment/cartservice \
-            --timeout=5m
-
-          echo ""
-          echo "REDIS_ADDR currently running in Kubernetes:"
-
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}'
-
-          echo ""
-
-          echo ""
-          echo "Cartservice image:"
-
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].image}'
-
-          echo ""
+            --timeout=300s
 
       # ========================================================
-      # VERIFY FRONTEND
+      # WAIT FOR FRONTEND
       # ========================================================
 
-      - name: Verify Frontend
-        shell: bash
+      - name: Wait for frontend
         run: |
-          set -e
 
           kubectl rollout status \
             deployment/frontend \
-            --timeout=5m
-
-          echo ""
-          echo "Frontend image:"
-
-          kubectl get deployment frontend \
-            -o jsonpath='{.spec.template.spec.containers[0].image}'
-
-          echo ""
+            --timeout=300s
 
       # ========================================================
-      # WAIT FOR ALL SERVICES
+      # WAIT FOR ALL DEPLOYMENTS
       # ========================================================
 
-      - name: Wait for Deployments
-        shell: bash
+      - name: Wait for all deployments
         run: |
-          set +e
 
           DEPLOYMENTS=(
             adservice
@@ -494,12 +518,11 @@ jobs:
             currencyservice
             emailservice
             frontend
+            loadgenerator
             paymentservice
             productcatalogservice
             recommendationservice
             shippingservice
-            redis-cart
-            loadgenerator
           )
 
           FAILED=0
@@ -507,17 +530,14 @@ jobs:
           for DEPLOYMENT in "${DEPLOYMENTS[@]}"; do
 
             echo ""
-            echo "======================================"
-            echo "WAITING FOR $DEPLOYMENT"
-            echo "======================================"
+            echo "Waiting for $DEPLOYMENT..."
 
             kubectl rollout status \
               deployment/"$DEPLOYMENT" \
-              --timeout=5m
+              --timeout=300s
 
             if [ $? -ne 0 ]; then
               echo "FAILED: $DEPLOYMENT"
-              kubectl describe deployment "$DEPLOYMENT" || true
               FAILED=1
             else
               echo "READY: $DEPLOYMENT"
@@ -528,6 +548,47 @@ jobs:
           if [ "$FAILED" -ne 0 ]; then
             exit 1
           fi
+
+      # ========================================================
+      # SET VALKEY ENDPOINT
+      # ========================================================
+
+      - name: Configure Valkey Endpoint
+        shell: bash
+        run: |
+
+          set -e
+
+          echo "======================================"
+          echo "CONFIGURING CARTSERVICE VALKEY"
+          echo "======================================"
+
+          VALKEY_ENDPOINT="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True"
+
+          kubectl set env deployment/cartservice \
+            REDIS_ADDR="$VALKEY_ENDPOINT"
+
+          echo ""
+          echo "Valkey endpoint configured."
+
+          echo ""
+          echo "Current REDIS_ADDR:"
+
+          kubectl get deployment cartservice \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}'
+
+          echo ""
+
+      # ========================================================
+      # WAIT FOR CARTSERVICE AFTER REDIS CHANGE
+      # ========================================================
+
+      - name: Wait for cartservice after Valkey configuration
+        run: |
+
+          kubectl rollout status \
+            deployment/cartservice \
+            --timeout=300s
 
       # ========================================================
       # FINAL STATUS
@@ -544,34 +605,43 @@ jobs:
 
           echo ""
           echo "DEPLOYMENTS:"
+
           kubectl get deployments
 
           echo ""
           echo "PODS:"
+
           kubectl get pods -o wide
 
           echo ""
           echo "SERVICES:"
+
           kubectl get services
 
           echo ""
           echo "FRONTEND IMAGE:"
+
           kubectl get deployment frontend \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' || true
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            || true
 
           echo ""
 
           echo ""
           echo "CARTSERVICE IMAGE:"
+
           kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' || true
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            || true
 
           echo ""
 
           echo ""
           echo "CARTSERVICE REDIS:"
+
           kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}' || true
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}' \
+            || true
 
           echo ""
 
@@ -590,22 +660,27 @@ jobs:
 
           echo ""
           echo "NODES:"
+
           kubectl get nodes -o wide || true
 
           echo ""
           echo "PODS:"
+
           kubectl get pods -o wide || true
 
           echo ""
           echo "DEPLOYMENTS:"
+
           kubectl get deployments || true
 
           echo ""
           echo "SERVICES:"
+
           kubectl get services || true
 
           echo ""
           echo "RECENT EVENTS:"
+
           kubectl get events \
             --sort-by='.lastTimestamp' |
             tail -100 || true
