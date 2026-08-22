@@ -198,17 +198,23 @@ shippingService:
       memory: 128Mi
 
 cartDatabase:
+  # External AWS ElastiCache Serverless Valkey
   type: redis
-  connectionString: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379"
 
+  # TLS is required by the ElastiCache Serverless endpoint
+  connectionString: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True"
+
+  # Do NOT deploy the Redis pod inside Kubernetes
   inClusterRedis:
     create: false
     name: redis-cart
     publicRepository: true
 
+  # Do NOT use Istio TLS origination.
+  # The application connects directly using StackExchange.Redis TLS.
   externalRedisTlsOrigination:
     enable: false
-    name: exernal-redis-tls-origination
+    name: external-redis-tls-origination
     endpointAddress: ""
     endpointPort: ""
     certificate: ""
