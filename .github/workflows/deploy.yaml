@@ -155,7 +155,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ========================================================
-      # AWS CREDENTIALS - KEEP WORKING ROLE
+      # AWS CREDENTIALS
       # ========================================================
 
       - name: Configure AWS Credentials
@@ -325,49 +325,6 @@ jobs:
           kubectl get nodes -o wide
 
       # ========================================================
-      # FORCE UPDATED IMAGES
-      # ========================================================
-
-      - name: Force updated images
-        shell: bash
-        env:
-          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
-
-        run: |
-
-          set -e
-
-          echo "======================================"
-          echo "FORCING UPDATED IMAGES"
-          echo "======================================"
-
-          if [ "$CHANGED_SERVICES" = "[]" ]; then
-
-            echo "No service image changes."
-
-          else
-
-            mapfile -t SERVICES < <(
-              echo "$CHANGED_SERVICES" | jq -r '.[]'
-            )
-
-            for SERVICE in "${SERVICES[@]}"; do
-
-              echo ""
-              echo "Updating $SERVICE..."
-
-              kubectl set image \
-                deployment/"$SERVICE" \
-                server="$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
-
-              echo "Image:"
-              echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
-
-            done
-
-          fi
-
-      # ========================================================
       # INSTALL KUSTOMIZE
       # ========================================================
 
@@ -435,10 +392,18 @@ jobs:
           echo "$IMAGE_TAG"
 
       # ========================================================
-      # UPDATE ONLY CHANGED IMAGES
+      # SYNC ALL IMAGE TAGS WITH REALITY
+      #
+      # Pour les services qui ont changé dans ce commit -> nouveau tag.
+      # Pour les services inchangés -> on relit le tag ACTUELLEMENT
+      # déployé sur le cluster (source de vérité), et pas celui figé
+      # dans le kustomization.yaml du repo, qui ne bouge jamais tout
+      # seul. C'est ça qui empêchait les nouvelles images de
+      # s'afficher: kustomize build réécrivait tous les services non
+      # modifiés avec leur tag d'origine committé dans git.
       # ========================================================
 
-      - name: Update Changed Kubernetes Images
+      - name: Sync all image tags with cluster reality
         shell: bash
         env:
           CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
@@ -450,31 +415,64 @@ jobs:
           cd "$KUSTOMIZATION_DIR"
 
           echo "======================================"
-          echo "UPDATING KUBERNETES IMAGES"
+          echo "SYNCING KUBERNETES IMAGE TAGS"
           echo "======================================"
 
-          if [ "$CHANGED_SERVICES" = "[]" ]; then
+          ALL_SERVICES=(
+            adservice
+            cartservice
+            checkoutservice
+            currencyservice
+            emailservice
+            frontend
+            paymentservice
+            productcatalogservice
+            recommendationservice
+            shippingservice
+          )
 
-            echo "No service images changed."
+          for SERVICE in "${ALL_SERVICES[@]}"; do
 
-          else
-
-            mapfile -t SERVICES < <(
-              echo "$CHANGED_SERVICES" | jq -r '.[]'
+            IS_CHANGED=$(
+              echo "$CHANGED_SERVICES" |
+              jq -e --arg s "$SERVICE" 'index($s) != null' \
+              > /dev/null && echo "true" || echo "false"
             )
 
-            for SERVICE in "${SERVICES[@]}"; do
+            if [ "$IS_CHANGED" = "true" ]; then
 
               echo ""
-              echo "Updating:"
-              echo "$SERVICE:$IMAGE_TAG"
+              echo "CHANGED -> new tag: $SERVICE:$IMAGE_TAG"
 
               kustomize edit set image \
                 "$ECR_REGISTRY/$SERVICE=$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
 
-            done
+            else
 
-          fi
+              CURRENT_IMAGE=$(
+                kubectl get deployment "$SERVICE" \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}' \
+                  2>/dev/null || echo ""
+              )
+
+              if [ -n "$CURRENT_IMAGE" ]; then
+
+                echo ""
+                echo "UNCHANGED -> keep deployed tag: $SERVICE -> $CURRENT_IMAGE"
+
+                kustomize edit set image \
+                  "$ECR_REGISTRY/$SERVICE=$CURRENT_IMAGE"
+
+              else
+
+                echo ""
+                echo "UNCHANGED -> no existing deployment found for $SERVICE, leaving as-is in kustomization.yaml"
+
+              fi
+
+            fi
+
+          done
 
           echo ""
           echo "======================================"
