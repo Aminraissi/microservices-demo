@@ -20,27 +20,56 @@ env:
 jobs:
 
   # ============================================================
-  # DETECT CHANGES
+  # BUILD + PUSH
   # ============================================================
 
-  detect-changes:
-    name: Detect Changed Services
+  build-and-push:
+    name: Build and Push Images
     runs-on: ubuntu-latest
-
-    outputs:
-      services: ${{ steps.detect.outputs.services }}
-      has_changes: ${{ steps.detect.outputs.has_changes }}
-      manifests_changed: ${{ steps.detect.outputs.manifests_changed }}
 
     steps:
 
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
-      - name: Detect changed services
-        id: detect
+      # IMPORTANT:
+      # Keep the same AWS authentication that was working before.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::501161805281:role/test
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ============================================================
+      # IMAGE TAG
+      # ============================================================
+
+      - name: Set Image Tag
+        shell: bash
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
+
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+          echo "======================================"
+          echo "IMAGE TAG: $IMAGE_TAG"
+          echo "======================================"
+
+      # ============================================================
+      # BUILD + PUSH ALL SERVICES
+      # ============================================================
+
+      - name: Build and Push All Services
         shell: bash
         run: |
           set -e
@@ -58,163 +87,26 @@ jobs:
             shippingservice
           )
 
-          CHANGED_SERVICES=()
-
-          echo "======================================"
-          echo "CHECKING CHANGED FILES"
-          echo "======================================"
-
-          git diff --name-only HEAD^ HEAD
-
-          for SERVICE in "${SERVICES[@]}"; do
-            if git diff --quiet HEAD^ HEAD -- "src/$SERVICE"; then
-              echo "UNCHANGED: $SERVICE"
-            else
-              echo "CHANGED:   $SERVICE"
-              CHANGED_SERVICES+=("$SERVICE")
-            fi
-          done
-
-          if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
-            SERVICES_JSON="[]"
-            HAS_CHANGES="false"
-          else
-            SERVICES_JSON=$(
-              printf '%s\n' "${CHANGED_SERVICES[@]}" |
-              jq -R . |
-              jq -sc .
-            )
-            HAS_CHANGES="true"
-          fi
-
-          # Helm/chart/values changes must trigger deployment even when
-          # no application image changed.
-          if git diff --quiet HEAD^ HEAD -- \
-            Chart.yaml \
-            values.yaml \
-            helm/ \
-            helm-chart/ \
-            charts/; then
-            MANIFESTS_CHANGED="false"
-          else
-            MANIFESTS_CHANGED="true"
-          fi
-
-          echo ""
-          echo "Changed services:"
-          echo "$SERVICES_JSON"
-
-          echo ""
-          echo "Has image changes: $HAS_CHANGES"
-
-          echo ""
-          echo "Helm/chart changes: $MANIFESTS_CHANGED"
-
-          echo "services=$SERVICES_JSON" >> "$GITHUB_OUTPUT"
-          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
-          echo "manifests_changed=$MANIFESTS_CHANGED" >> "$GITHUB_OUTPUT"
-
-
-  # ============================================================
-  # BUILD AND PUSH
-  # ============================================================
-
-  build-and-push:
-    name: Build and Push Changed Images
-    runs-on: ubuntu-latest
-
-    needs: detect-changes
-
-    if: needs.detect-changes.outputs.has_changes == 'true'
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ========================================================
-      # AWS CREDENTIALS - KEEP THE WORKING ROLE
-      # ========================================================
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::501161805281:role/test
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Verify AWS Identity
-        run: |
-          aws sts get-caller-identity
-
-      # ========================================================
-      # ECR LOGIN
-      # ========================================================
-
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # ========================================================
-      # DOCKER BUILDX
-      # ========================================================
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ========================================================
-      # IMAGE TAG
-      # ========================================================
-
-      - name: Set Image Tag
-        shell: bash
-        run: |
-          IMAGE_TAG="${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}"
-
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-
-          echo "======================================"
-          echo "IMAGE TAG"
-          echo "======================================"
-          echo "$IMAGE_TAG"
-
-      # ========================================================
-      # BUILD AND PUSH
-      # ========================================================
-
-      - name: Build and Push Changed Images
-        shell: bash
-        env:
-          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
-        run: |
-          set -e
-
-          echo "======================================"
-          echo "BUILDING CHANGED SERVICES"
-          echo "======================================"
-
-          mapfile -t SERVICES < <(
-            echo "$CHANGED_SERVICES" | jq -r '.[]'
-          )
-
           for SERVICE in "${SERVICES[@]}"; do
 
-            echo ""
             echo "======================================"
-            echo "BUILDING: $SERVICE"
+            echo "BUILDING $SERVICE"
             echo "======================================"
 
             CONTEXT="src/$SERVICE"
             DOCKERFILE="$CONTEXT/Dockerfile"
 
-            # Cartservice has a different Docker build structure.
+            # Cartservice has its Dockerfile in a different directory
             if [ "$SERVICE" = "cartservice" ]; then
               CONTEXT="src/cartservice/src"
               DOCKERFILE="src/cartservice/src/Dockerfile"
             fi
 
-            echo "Dockerfile: $DOCKERFILE"
-            echo "Context:    $CONTEXT"
-
-            test -f "$DOCKERFILE"
+            if [ ! -f "$DOCKERFILE" ]; then
+              echo "ERROR: Dockerfile not found:"
+              echo "$DOCKERFILE"
+              exit 1
+            fi
 
             docker buildx build \
               --platform linux/amd64 \
@@ -224,15 +116,10 @@ jobs:
               --push \
               "$CONTEXT"
 
-            echo ""
-            echo "Successfully pushed:"
-            echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
-
           done
 
-
   # ============================================================
-  # DEPLOY TO EKS WITH HELM
+  # DEPLOY
   # ============================================================
 
   deploy:
@@ -240,30 +127,15 @@ jobs:
     runs-on: ubuntu-latest
 
     needs:
-      - detect-changes
       - build-and-push
 
-    if: |
-      always() &&
-      (
-        needs.detect-changes.outputs.has_changes == 'true' ||
-        needs.detect-changes.outputs.manifests_changed == 'true'
-      ) &&
-      needs.build-and-push.result != 'failure'
-
     steps:
-
-      # ========================================================
-      # CHECKOUT
-      # ========================================================
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ========================================================
-      # AWS - KEEP THE WORKING ROLE
-      # ========================================================
-
+      # IMPORTANT:
+      # Same working AWS role.
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -274,9 +146,9 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-      # ========================================================
+      # ============================================================
       # EKS
-      # ========================================================
+      # ============================================================
 
       - name: Configure kubectl
         shell: bash
@@ -292,28 +164,26 @@ jobs:
           echo "======================================"
 
           kubectl cluster-info
+
+          echo "======================================"
+          echo "NODES"
+          echo "======================================"
+
           kubectl get nodes -o wide
 
-      # ========================================================
+      # ============================================================
       # HELM
-      # ========================================================
+      # ============================================================
 
       - name: Install Helm
         uses: azure/setup-helm@v4
-
-      # ========================================================
-      # FIND HELM CHART
-      # ========================================================
 
       - name: Find Helm Chart
         shell: bash
         run: |
           set -e
 
-          CHART_FILE=$(find . \
-            -name Chart.yaml \
-            -type f \
-            | head -1)
+          CHART_FILE=$(find . -name Chart.yaml -type f | head -1)
 
           if [ -z "$CHART_FILE" ]; then
             echo "ERROR: Chart.yaml not found"
@@ -324,16 +194,12 @@ jobs:
 
           echo "HELM_CHART_DIR=$HELM_CHART_DIR" >> "$GITHUB_ENV"
 
-          echo "Found Helm chart:"
+          echo "Helm chart:"
           echo "$HELM_CHART_DIR"
 
-          echo ""
-          echo "Chart:"
-          cat "$CHART_FILE"
-
-      # ========================================================
+      # ============================================================
       # IMAGE TAG
-      # ========================================================
+      # ============================================================
 
       - name: Set Image Tag
         shell: bash
@@ -342,12 +208,14 @@ jobs:
 
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
 
-          echo "IMAGE TAG:"
+          echo "======================================"
+          echo "IMAGE TAG"
           echo "$IMAGE_TAG"
+          echo "======================================"
 
-      # ========================================================
-      # VERIFY VALUES.YAML
-      # ========================================================
+      # ============================================================
+      # CHECK VALUES
+      # ============================================================
 
       - name: Verify values.yaml
         shell: bash
@@ -357,47 +225,88 @@ jobs:
           VALUES_FILE="$HELM_CHART_DIR/values.yaml"
 
           if [ ! -f "$VALUES_FILE" ]; then
-            echo "ERROR: values.yaml not found at $VALUES_FILE"
+            echo "ERROR: values.yaml not found"
             exit 1
           fi
 
           echo "======================================"
-          echo "values.yaml"
+          echo "CART DATABASE CONFIGURATION"
           echo "======================================"
 
-          cat "$VALUES_FILE"
+          grep -A20 "^cartDatabase:" "$VALUES_FILE"
 
-      # ========================================================
-      # RENDER HELM
-      # ========================================================
+          echo "======================================"
+          echo "IMAGE CONFIGURATION"
+          echo "======================================"
 
-      - name: Render Helm manifests
+          grep -A3 "^images:" "$VALUES_FILE"
+
+      # ============================================================
+      # HELM TEMPLATE VALIDATION
+      # ============================================================
+
+      - name: Render Helm Manifests
         shell: bash
         run: |
           set -e
 
           echo "======================================"
-          echo "HELM TEMPLATE"
+          echo "RENDERING HELM"
           echo "======================================"
 
           helm template onlineboutique "$HELM_CHART_DIR" \
-            --set images.repository="$ECR_REGISTRY" \
-            --set images.tag="$IMAGE_TAG" \
+            --namespace default \
+            --set-string images.repository="$ECR_REGISTRY" \
+            --set-string images.tag="$IMAGE_TAG" \
+            --set-string cartDatabase.connectionString="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True" \
+            --set cartDatabase.inClusterRedis.create=false \
+            --set cartDatabase.externalRedisTlsOrigination.enable=false \
             > /tmp/rendered.yaml
 
-          echo ""
-          echo "Checking REDIS_ADDR / Redis configuration..."
-
-          grep -A3 -B2 "REDIS_ADDR" /tmp/rendered.yaml || true
+          echo "Helm rendering successful."
 
           echo ""
-          echo "Checking frontend image..."
+          echo "======================================"
+          echo "REDIS CONFIGURATION"
+          echo "======================================"
 
-          grep -A2 "name: frontend" /tmp/rendered.yaml | head -20 || true
+          grep -A3 -B3 "REDIS_ADDR" /tmp/rendered.yaml || true
 
-      # ========================================================
-      # HELM DEPLOY
-      # ========================================================
+          echo ""
+          echo "======================================"
+          echo "CHECK REDIS TLS"
+          echo "======================================"
+
+          if ! grep -q \
+            'googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True' \
+            /tmp/rendered.yaml; then
+
+            echo "ERROR: Redis TLS configuration was not rendered."
+            exit 1
+          fi
+
+          echo "Redis TLS configuration OK."
+
+          echo ""
+          echo "======================================"
+          echo "CHECK ISTIO"
+          echo "======================================"
+
+          if grep -q 'kind: DestinationRule' /tmp/rendered.yaml; then
+            echo "ERROR: DestinationRule detected."
+            exit 1
+          fi
+
+          if grep -q 'kind: ServiceEntry' /tmp/rendered.yaml; then
+            echo "ERROR: ServiceEntry detected."
+            exit 1
+          fi
+
+          echo "No Istio Redis TLS resources detected."
+
+      # ============================================================
+      # HELM DEPLOYMENT
+      # ============================================================
 
       - name: Deploy with Helm
         shell: bash
@@ -410,25 +319,29 @@ jobs:
 
           helm upgrade --install onlineboutique "$HELM_CHART_DIR" \
             --namespace default \
-            --set images.repository="$ECR_REGISTRY" \
-            --set images.tag="$IMAGE_TAG" \
+            --set-string images.repository="$ECR_REGISTRY" \
+            --set-string images.tag="$IMAGE_TAG" \
+            --set-string cartDatabase.connectionString="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True" \
+            --set cartDatabase.inClusterRedis.create=false \
+            --set cartDatabase.externalRedisTlsOrigination.enable=false \
             --wait \
             --timeout 10m
 
-          echo ""
-          echo "Helm deployment completed."
+          echo "======================================"
+          echo "HELM DEPLOYMENT SUCCESSFUL"
+          echo "======================================"
 
-      # ========================================================
-      # VERIFY CARTSERVICE REDIS
-      # ========================================================
+      # ============================================================
+      # CARTSERVICE
+      # ============================================================
 
-      - name: Verify Cartservice Redis Configuration
+      - name: Verify Cartservice
         shell: bash
         run: |
           set -e
 
           echo "======================================"
-          echo "VERIFYING CARTSERVICE"
+          echo "WAITING FOR CARTSERVICE"
           echo "======================================"
 
           kubectl rollout status \
@@ -436,50 +349,78 @@ jobs:
             --timeout=5m
 
           echo ""
-          echo "REDIS_ADDR currently running in Kubernetes:"
+          echo "======================================"
+          echo "CARTSERVICE IMAGE"
+          echo "======================================"
 
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}'
+          IMAGE=$(kubectl get deployment cartservice \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
 
-          echo ""
-
-          echo ""
-          echo "Cartservice image:"
-
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo "$IMAGE"
 
           echo ""
+          echo "======================================"
+          echo "REDIS ADDRESS"
+          echo "======================================"
 
-      # ========================================================
-      # VERIFY FRONTEND
-      # ========================================================
+          REDIS_ADDR=$(kubectl get deployment cartservice \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}')
+
+          echo "$REDIS_ADDR"
+
+          echo ""
+          echo "======================================"
+          echo "VERIFY REDIS TLS"
+          echo "======================================"
+
+          EXPECTED="googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379,ssl=True"
+
+          if [ "$REDIS_ADDR" != "$EXPECTED" ]; then
+            echo "ERROR: Incorrect REDIS_ADDR"
+            echo "Expected:"
+            echo "$EXPECTED"
+            echo "Actual:"
+            echo "$REDIS_ADDR"
+            exit 1
+          fi
+
+          echo "Redis TLS configuration is correct."
+
+      # ============================================================
+      # FRONTEND
+      # ============================================================
 
       - name: Verify Frontend
         shell: bash
         run: |
           set -e
 
+          echo "======================================"
+          echo "WAITING FOR FRONTEND"
+          echo "======================================"
+
           kubectl rollout status \
             deployment/frontend \
             --timeout=5m
 
           echo ""
-          echo "Frontend image:"
+          echo "======================================"
+          echo "FRONTEND IMAGE"
+          echo "======================================"
 
           kubectl get deployment frontend \
             -o jsonpath='{.spec.template.spec.containers[0].image}'
 
-          echo ""
+          echo
 
-      # ========================================================
-      # WAIT FOR ALL SERVICES
-      # ========================================================
+      # ============================================================
+      # ALL DEPLOYMENTS
+      # ============================================================
 
-      - name: Wait for Deployments
+      - name: Wait for All Deployments
         shell: bash
         run: |
-          set +e
+          set -e
 
           DEPLOYMENTS=(
             adservice
@@ -488,19 +429,15 @@ jobs:
             currencyservice
             emailservice
             frontend
+            loadgenerator
             paymentservice
             productcatalogservice
             recommendationservice
             shippingservice
-            redis-cart
-            loadgenerator
           )
-
-          FAILED=0
 
           for DEPLOYMENT in "${DEPLOYMENTS[@]}"; do
 
-            echo ""
             echo "======================================"
             echo "WAITING FOR $DEPLOYMENT"
             echo "======================================"
@@ -509,97 +446,105 @@ jobs:
               deployment/"$DEPLOYMENT" \
               --timeout=5m
 
-            if [ $? -ne 0 ]; then
-              echo "FAILED: $DEPLOYMENT"
-              kubectl describe deployment "$DEPLOYMENT" || true
-              FAILED=1
-            else
-              echo "READY: $DEPLOYMENT"
-            fi
-
           done
 
-          if [ "$FAILED" -ne 0 ]; then
-            exit 1
-          fi
-
-      # ========================================================
+      # ============================================================
       # FINAL STATUS
-      # ========================================================
+      # ============================================================
 
-      - name: Show Deployment Status
+      - name: Final Status
         if: always()
         shell: bash
         run: |
 
           echo "======================================"
-          echo "DEPLOYMENT STATUS"
+          echo "DEPLOYMENTS"
           echo "======================================"
 
-          echo ""
-          echo "DEPLOYMENTS:"
-          kubectl get deployments
-
-          echo ""
-          echo "PODS:"
-          kubectl get pods -o wide
-
-          echo ""
-          echo "SERVICES:"
-          kubectl get services
-
-          echo ""
-          echo "FRONTEND IMAGE:"
-          kubectl get deployment frontend \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' || true
-
-          echo ""
-
-          echo ""
-          echo "CARTSERVICE IMAGE:"
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' || true
-
-          echo ""
-
-          echo ""
-          echo "CARTSERVICE REDIS:"
-          kubectl get deployment cartservice \
-            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}' || true
-
-          echo ""
-
-      # ========================================================
-      # DIAGNOSTICS
-      # ========================================================
-
-      - name: Diagnostics
-        if: always()
-        shell: bash
-        run: |
-
-          echo "======================================"
-          echo "FINAL CLUSTER STATUS"
-          echo "======================================"
-
-          echo ""
-          echo "NODES:"
-          kubectl get nodes -o wide || true
-
-          echo ""
-          echo "PODS:"
-          kubectl get pods -o wide || true
-
-          echo ""
-          echo "DEPLOYMENTS:"
           kubectl get deployments || true
 
           echo ""
-          echo "SERVICES:"
+          echo "======================================"
+          echo "PODS"
+          echo "======================================"
+
+          kubectl get pods -o wide || true
+
+          echo ""
+          echo "======================================"
+          echo "SERVICES"
+          echo "======================================"
+
           kubectl get services || true
 
           echo ""
-          echo "RECENT EVENTS:"
+          echo "======================================"
+          echo "FRONTEND IMAGE"
+          echo "======================================"
+
+          kubectl get deployment frontend \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            || true
+
+          echo
+
+          echo ""
+          echo "======================================"
+          echo "CARTSERVICE IMAGE"
+          echo "======================================"
+
+          kubectl get deployment cartservice \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            || true
+
+          echo
+
+          echo ""
+          echo "======================================"
+          echo "CARTSERVICE REDIS"
+          echo "======================================"
+
+          kubectl get deployment cartservice \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_ADDR")].value}' \
+            || true
+
+          echo
+
+      # ============================================================
+      # DIAGNOSTICS
+      # ============================================================
+
+      - name: Diagnostics
+        if: failure()
+        shell: bash
+        run: |
+
+          echo "======================================"
+          echo "PODS"
+          echo "======================================"
+
+          kubectl get pods -o wide || true
+
+          echo ""
+          echo "======================================"
+          echo "CARTSERVICE DESCRIPTION"
+          echo "======================================"
+
+          kubectl describe deployment cartservice || true
+
+          echo ""
+          echo "======================================"
+          echo "CARTSERVICE LOGS"
+          echo "======================================"
+
+          kubectl logs deployment/cartservice \
+            --tail=100 || true
+
+          echo ""
+          echo "======================================"
+          echo "EVENTS"
+          echo "======================================"
+
           kubectl get events \
-            --sort-by='.lastTimestamp' |
-            tail -100 || true
+            --sort-by='.lastTimestamp' \
+            | tail -100 || true
