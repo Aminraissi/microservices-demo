@@ -198,19 +198,19 @@ shippingService:
       memory: 128Mi
 
 cartDatabase:
-  # Specifies the type of the cartservice's database, could be either redis or spanner.
   type: redis
-  connectionString: "redis-cart:6379"
+  connectionString: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com:6379"
+  
   inClusterRedis:
-    create: true
+    create: false
     name: redis-cart
-    # Uses the public redis image from Docker Hub, otherwise will use the images.repository.
     publicRepository: true
+
   externalRedisTlsOrigination:
-    enable: false
-    name: exernal-redis-tls-origination
-    endpointAddress: ""
-    endpointPort: ""
+    enable: true
+    name: external-redis-tls-origination
+    endpointAddress: "googlecluster-88y4r8.serverless.euw1.cache.amazonaws.com"
+    endpointPort: "6379"
     certificate: ""
 
 # @TODO: This service is not currently available in Helm.
