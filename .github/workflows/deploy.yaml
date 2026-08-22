@@ -280,50 +280,12 @@ jobs:
 
     steps:
 
+      # ========================================================
+      # CHECKOUT
+      # ========================================================
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      # ========================================================
-      # FORCE UPDATED IMAGES
-      # ========================================================
-
-      - name: Force updated images
-        shell: bash
-        env:
-          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
-        run: |
-
-          set -e
-
-          echo "======================================"
-          echo "FORCING UPDATED IMAGES"
-          echo "======================================"
-
-          if [ "$CHANGED_SERVICES" = "[]" ]; then
-
-            echo "No service image changes."
-
-          else
-
-            mapfile -t SERVICES < <(
-              echo "$CHANGED_SERVICES" | jq -r '.[]'
-            )
-
-            for SERVICE in "${SERVICES[@]}"; do
-
-              echo ""
-              echo "Updating $SERVICE..."
-
-              kubectl set image \
-                deployment/"$SERVICE" \
-                server="$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
-
-              echo "Image:"
-              echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
-
-            done
-
-          fi
 
       # ========================================================
       # AWS
@@ -361,6 +323,49 @@ jobs:
 
           echo ""
           kubectl get nodes -o wide
+
+      # ========================================================
+      # FORCE UPDATED IMAGES
+      # ========================================================
+
+      - name: Force updated images
+        shell: bash
+        env:
+          CHANGED_SERVICES: ${{ needs.detect-changes.outputs.services }}
+
+        run: |
+
+          set -e
+
+          echo "======================================"
+          echo "FORCING UPDATED IMAGES"
+          echo "======================================"
+
+          if [ "$CHANGED_SERVICES" = "[]" ]; then
+
+            echo "No service image changes."
+
+          else
+
+            mapfile -t SERVICES < <(
+              echo "$CHANGED_SERVICES" | jq -r '.[]'
+            )
+
+            for SERVICE in "${SERVICES[@]}"; do
+
+              echo ""
+              echo "Updating $SERVICE..."
+
+              kubectl set image \
+                deployment/"$SERVICE" \
+                server="$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
+              echo "Image:"
+              echo "$ECR_REGISTRY/$SERVICE:$IMAGE_TAG"
+
+            done
+
+          fi
 
       # ========================================================
       # INSTALL KUSTOMIZE
@@ -579,10 +584,14 @@ jobs:
               --timeout=300s
 
             if [ $? -ne 0 ]; then
+
               echo "FAILED: $DEPLOYMENT"
               FAILED=1
+
             else
+
               echo "READY: $DEPLOYMENT"
+
             fi
 
           done
