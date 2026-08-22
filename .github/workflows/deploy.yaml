@@ -424,9 +424,6 @@ jobs:
             --wait \
             --timeout 10m
 
-          echo ""
-          echo "Helm deployment completed."
-
       # ========================================================
       # VERIFY CARTSERVICE REDIS
       # ========================================================
